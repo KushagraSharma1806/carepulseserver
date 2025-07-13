@@ -1,11 +1,11 @@
 fastapi
 uvicorn
 sqlalchemy
-pydantic
 python-dotenv
-python-jose
+pydantic
+python-jose[cryptography]
 passlib[bcrypt]
 apscheduler
-httpx
 openai
+httpx
 pymysql
