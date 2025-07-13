@@ -8,3 +8,4 @@ passlib[bcrypt]
 apscheduler
 openai
 httpx
+pymysql
