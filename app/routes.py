@@ -6,8 +6,7 @@ from pydantic import BaseModel
 import os
 import random
 from dotenv import load_dotenv
-import jwt
-from jwt import PyJWTError
+from jose import jwt, PyJWTError
 import json
 import logging
 
@@ -89,12 +88,9 @@ async def get_current_user_websocket(websocket: WebSocket):
             raise HTTPException(status_code=401, detail="Invalid token")
 
         return {"id": user_id, "email": payload.get("email")}
-    except jwt.ExpiredSignatureError:
+    except PyJWTError:
         await websocket.close(code=1008)
-        raise HTTPException(status_code=401, detail="Token expired")
-    except jwt.InvalidTokenError:
-        await websocket.close(code=1008)
-        raise HTTPException(status_code=401, detail="Invalid token")
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
     except Exception as e:
         await websocket.close(code=1011)
         raise HTTPException(status_code=500, detail=str(e))
