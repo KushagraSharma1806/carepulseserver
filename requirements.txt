@@ -10,3 +10,4 @@ openai
 httpx
 pymysql
 jwt
+PyJWT
