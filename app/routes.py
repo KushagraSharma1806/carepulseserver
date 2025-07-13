@@ -6,7 +6,7 @@ from pydantic import BaseModel
 import os
 import random
 from dotenv import load_dotenv
-from jose import jwt, PyJWTError
+from jose import jwt, JWTError  # ✅ Fixed import
 import json
 import logging
 
@@ -17,7 +17,6 @@ load_dotenv(dotenv_path="./.env")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Import your existing schemas, models, and auth utilities
 from .schemas import (
     UserCreate, UserLogin, UserOut,
     VitalsCreate, VitalsOut,
@@ -29,7 +28,6 @@ from .database import get_db
 from .specialization_mapping import get_specialist_for_symptom
 import openai
 
-# Configure OpenAI (if using OpenRouter)
 openai.api_key = os.getenv("OPENROUTER_API_KEY")
 openai.api_base = os.getenv("OPENROUTER_API_BASE", "https://openrouter.ai/api/v1")
 
@@ -88,7 +86,7 @@ async def get_current_user_websocket(websocket: WebSocket):
             raise HTTPException(status_code=401, detail="Invalid token")
 
         return {"id": user_id, "email": payload.get("email")}
-    except PyJWTError:
+    except JWTError:  # ✅ Fixed error handling
         await websocket.close(code=1008)
         raise HTTPException(status_code=401, detail="Invalid or expired token")
     except Exception as e:
