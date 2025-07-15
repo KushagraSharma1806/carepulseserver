@@ -6,7 +6,7 @@ pydantic[email]
 python-jose[cryptography]
 passlib[bcrypt]
 apscheduler
-openai
+openai==0.28
 httpx
 pymysql
 pytz
