@@ -1,22 +1,30 @@
-from sqlalchemy import create_engine
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
-import os
+from motor.motor_asyncio import AsyncIOMotorClient
+from beanie import init_beanie
 from dotenv import load_dotenv
+import os
 
+from app.models import User, Vitals, Appointment, Doctor  # ✅ Import your Beanie models
+
+# Load environment variables
 load_dotenv()
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+# MongoDB URI from .env
+MONGO_URI = os.getenv("MONGO_URI")
 
-# If using pymysql, this prefix is required
-engine = create_engine(DATABASE_URL)
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
-Base = declarative_base()
+if not MONGO_URI:
+    raise ValueError("⚠️ MONGO_URI is not set in the .env file!")
 
-# ✅ THIS IS THE FUNCTION THAT MUST EXIST
-def get_db():
-    db: Session = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+# Create Motor client
+client = AsyncIOMotorClient(MONGO_URI)
+db = client["carepulse"]  # You can rename this if needed
+
+# ✅ Beanie Initialization function
+async def init_db():
+    await init_beanie(
+        database=db,
+        document_models=[User, Vitals, Appointment, Doctor]
+    )
+
+# ✅ Dependency for FastAPI routes
+async def get_db():
+    return db

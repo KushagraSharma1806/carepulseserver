@@ -1,60 +1,55 @@
+# app/models.py
+
+from beanie import Document
+from pydantic import BaseModel, EmailStr, Field
+from typing import Optional
 from datetime import datetime
-from sqlalchemy import Column, Integer, String, DateTime,Float, ForeignKey, Boolean
-from sqlalchemy.sql import func
-from sqlalchemy.orm import relationship
-from .database import Base
 
-class User(Base):
-    __tablename__ = "users"
+# ✅ USER
+class User(Document):
+    name: str
+    email: EmailStr
+    password: str
+    role: str = "patient"
 
-    id = Column(Integer, primary_key=True, index=True)
-    name = Column(String(100), nullable=False)
-    email = Column(String(100), unique=True, index=True, nullable=False)
-    password = Column(String(255), nullable=False)
-    role = Column(String(50), default="patient")  # patient or doctor
+    class Settings:
+        name = "users"  # MongoDB collection name
 
-    # Relationships
-    vitals = relationship("Vitals", back_populates="user")
-    appointments = relationship("Appointment", back_populates="user")
+# ✅ VITALS
+class Vitals(Document):
+    user_id: str  # Reference to User._id as string
+    heart_rate: int
+    bp_systolic: int
+    bp_diastolic: int
+    oxygen: int
+    temperature: float
+    sugar: int
+    symptoms: str
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
 
-class Vitals(Base):
-    __tablename__ = "vitals"
+    class Settings:
+        name = "vitals"
 
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"))
-    heart_rate = Column(Integer)
-    bp_systolic = Column(Integer)
-    bp_diastolic = Column(Integer)
-    oxygen = Column(Integer)
-    temperature = Column(Float)  # Changed to Float for more precise temperature
-    sugar = Column(Integer)
-    symptoms = Column(String(500))  # Increased length for more detailed symptoms
-    timestamp = Column(DateTime(timezone=True), server_default=func.now())
+# ✅ APPOINTMENT
+class Appointment(Document):
+    user_id: str
+    reason: str
+    notes: Optional[str]
+    doctor_name: str = "Dr. Auto Assign"
+    status: str = "pending"
+    preferred_date: Optional[datetime]
+    preferred_time: Optional[str]
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: Optional[datetime]
 
-    # Relationships
-    user = relationship("User", back_populates="vitals")
+    class Settings:
+        name = "appointments"
 
-class Appointment(Base):
-    __tablename__ = "appointments"
+# ✅ DOCTOR
+class Doctor(Document):
+    name: str
+    specialization: str
+    is_available: bool = True
 
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"))
-    reason = Column(String(500), nullable=False)
-    notes = Column(String(1000))  # Added for additional appointment notes
-    doctor_name = Column(String(100), default="Dr. Auto Assign")
-    status = Column(String(50), default="pending")  # pending, confirmed, cancelled, completed
-    preferred_date = Column(DateTime)  # Added for scheduling
-    preferred_time = Column(String(50))  # Added for time slots
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
-
-    # Relationships
-    user = relationship("User", back_populates="appointments")
-
-class Doctor(Base):
-    __tablename__ = "doctors"
-
-    id = Column(Integer, primary_key=True, index=True)
-    name = Column(String(100), nullable=False)
-    specialization = Column(String(100), nullable=False)
-    is_available = Column(Boolean, default=True)
+    class Settings:
+        name = "doctors"

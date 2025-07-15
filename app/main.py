@@ -1,37 +1,36 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from .database import engine
-from . import models
-from .routes import router
-from .scheduler import assign_pending_appointments
-import threading
-import time
+from app.routes import router
+from app.database import init_db
+from app.scheduler import assign_pending_appointments_mongo
+import asyncio
 
 app = FastAPI()
 
-# Enable CORS for frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],  # Update to match your frontend
+    allow_origins=["http://localhost:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Create tables
-models.Base.metadata.create_all(bind=engine)
+# ✅ Background coroutine
+async def scheduler_loop():
+    while True:
+        try:
+            await assign_pending_appointments_mongo()
+        except Exception as e:
+            print(f"❌ Error during MongoDB appointment assignment: {e}")
+        await asyncio.sleep(60)
+
+@app.on_event("startup")
+async def app_startup():
+    await init_db()
+    print("✅ Beanie initialized with MongoDB")
+
+    asyncio.create_task(scheduler_loop())  # ✅ No new thread, stays in FastAPI loop
+    print("✅ Background MongoDB scheduler started")
 
 # Include routes
 app.include_router(router)
-
-# Background job to assign doctors to pending appointments
-def run_scheduler():
-    while True:
-        assign_pending_appointments()
-        time.sleep(60)  # Runs every 60 seconds
-
-@app.on_event("startup")
-def start_background_worker():
-    threading.Thread(target=run_scheduler, daemon=True).start()
-    print("✅ Background task for auto-assigning appointments started.")
-

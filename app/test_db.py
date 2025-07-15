@@ -1,8 +1,9 @@
-from .database import SessionLocal
+from motor.motor_asyncio import AsyncIOMotorClient
 
+uri = "mongodb+srv://kushagrasharma1806:Kushagra@carepulse.59jpq40.mongodb.net/?retryWrites=true&w=majority&appName=Carepulse"
+client = AsyncIOMotorClient(uri)
 try:
-    db = SessionLocal()
-    print("✅ MySQL connection successful!")
-    db.close()
+    client.admin.command('ping')
+    print("✅ MongoDB connection successful")
 except Exception as e:
-    print("❌ Connection error:", e)
+    print("❌ Error connecting:", e)

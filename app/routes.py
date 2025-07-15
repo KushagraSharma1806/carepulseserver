@@ -1,38 +1,34 @@
 from fastapi import APIRouter, HTTPException, Depends, Query, WebSocket, WebSocketDisconnect
-from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
 from typing import List, Optional, Dict
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import os
-import random
-from dotenv import load_dotenv
-from jose import jwt, JWTError  # ✅ Fixed import
 import json
 import logging
+from jose import jwt, JWTError
+from dotenv import load_dotenv
+from bson import ObjectId
+
+from .database import db  # MongoDB database client
+from .auth import hash_password, verify_password, create_access_token, get_current_user
+from .specialization_mapping import get_specialist_for_symptom
+import openai
 
 # Load environment variables
 load_dotenv(dotenv_path="./.env")
 
-# Configure logging
+# Logging setup
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-from .schemas import (
-    UserCreate, UserLogin, UserOut,
-    VitalsCreate, VitalsOut,
-    AppointmentCreate, AppointmentOut
-)
-from .models import User, Vitals, Appointment, Doctor
-from .auth import hash_password, verify_password, create_access_token, get_current_user
-from .database import get_db
-from .specialization_mapping import get_specialist_for_symptom
-import openai
-
+# OpenRouter config
 openai.api_key = os.getenv("OPENROUTER_API_KEY")
 openai.api_base = os.getenv("OPENROUTER_API_BASE", "https://openrouter.ai/api/v1")
 
 router = APIRouter()
 
+
+# ==== Models ====
 class SymptomInput(BaseModel):
     symptoms: str
 
@@ -40,6 +36,49 @@ class TokenRefreshResponse(BaseModel):
     access_token: str
     token_type: str
 
+class UserCreate(BaseModel):
+    name: str
+    email: str
+    password: str
+
+class UserLogin(BaseModel):
+    email: str
+    password: str
+
+class UserOut(BaseModel):
+    id: str = Field(..., alias="_id")
+    name: str
+    email: str
+    role: str
+
+class VitalsCreate(BaseModel):
+    heart_rate: int
+    bp_systolic: int
+    bp_diastolic: int
+    oxygen: int
+    temperature: float
+    sugar: int
+    symptoms: str
+
+class VitalsOut(VitalsCreate):
+    id: str = Field(..., alias="_id")
+    timestamp: datetime
+
+class AppointmentCreate(BaseModel):
+    reason: str
+    notes: Optional[str]
+    preferred_date: datetime
+    preferred_time: str
+
+class AppointmentOut(AppointmentCreate):
+    id: str = Field(..., alias="_id")
+    user_id: str
+    doctor_name: str
+    status: str
+    created_at: datetime
+
+
+# ==== WebSocket Connection Manager ====
 class ConnectionManager:
     def __init__(self):
         self.active_connections: Dict[str, WebSocket] = {}
@@ -47,31 +86,29 @@ class ConnectionManager:
     async def connect(self, websocket: WebSocket, user_id: str):
         await websocket.accept()
         self.active_connections[user_id] = websocket
-        logger.info(f"User {user_id} connected to WebSocket")
 
     def disconnect(self, user_id: str):
-        if user_id in self.active_connections:
-            del self.active_connections[user_id]
-            logger.info(f"User {user_id} disconnected from WebSocket")
+        self.active_connections.pop(user_id, None)
 
     async def send_personal_message(self, message: str, user_id: str):
-        if user_id in self.active_connections:
+        ws = self.active_connections.get(user_id)
+        if ws:
             try:
-                await self.active_connections[user_id].send_text(message)
-            except Exception as e:
-                logger.error(f"Failed to send message to user {user_id}: {str(e)}")
+                await ws.send_text(message)
+            except Exception:
                 self.disconnect(user_id)
 
     async def broadcast(self, message: dict):
-        for user_id, connection in list(self.active_connections.items()):
+        for uid, ws in list(self.active_connections.items()):
             try:
-                await connection.send_json(message)
-            except Exception as e:
-                logger.error(f"Failed to broadcast to user {user_id}: {str(e)}")
-                self.disconnect(user_id)
+                await ws.send_json(message)
+            except Exception:
+                self.disconnect(uid)
 
 manager = ConnectionManager()
 
+
+# ==== Token auth for WebSocket ====
 async def get_current_user_websocket(websocket: WebSocket):
     try:
         token = websocket.query_params.get("token")
@@ -79,204 +116,216 @@ async def get_current_user_websocket(websocket: WebSocket):
             await websocket.close(code=1008)
             raise HTTPException(status_code=401, detail="Missing token")
 
-        payload = jwt.decode(token, os.getenv("SECRET_KEY"), algorithms=["HS256"])
-        user_id: str = payload.get("sub")
-        if user_id is None:
+        payload = jwt.decode(token, os.getenv("JWT_SECRET_KEY"), algorithms=["HS256"])
+        user_id = payload.get("sub")
+        email = payload.get("email")
+
+        if not user_id:
             await websocket.close(code=1008)
             raise HTTPException(status_code=401, detail="Invalid token")
 
-        return {"id": user_id, "email": payload.get("email")}
-    except JWTError:  # ✅ Fixed error handling
+        return {"id": user_id, "email": email}
+    except JWTError:
         await websocket.close(code=1008)
         raise HTTPException(status_code=401, detail="Invalid or expired token")
     except Exception as e:
         await websocket.close(code=1011)
         raise HTTPException(status_code=500, detail=str(e))
 
+
+# ==== AI Assistant ====
 async def get_ai_response(symptoms: str) -> str:
     try:
         response = openai.ChatCompletion.create(
             model="mistralai/mistral-7b-instruct",
             messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a helpful and friendly medical assistant. "
-                        "Provide:\n"
-                        "1. Possible non-emergency explanations\n"
-                        "2. Self-care recommendations if appropriate\n"
-                        "3. When to consult a doctor\n"
-                        "4. Red flags to watch for\n\n"
-                        "Guidelines:\n"
-                        "- Do not diagnose\n"
-                        "- Be concise (under 200 words)\n"
-                        "- Use simple language\n"
-                        "- Show empathy and care"
-                    )
-                },
-                {
-                    "role": "user",
-                    "content": f"I am experiencing: {symptoms}"
-                }
+                {"role": "system", "content": (
+                    "You are a helpful medical assistant. Provide possible causes, home remedies, "
+                    "and when to see a doctor. Be clear, caring, and under 200 words.")},
+                {"role": "user", "content": f"I am experiencing: {symptoms}"}
             ],
             temperature=0.6,
             max_tokens=250
         )
         return response.choices[0].message["content"].strip()
     except Exception as e:
-        logger.error(f"OpenRouter API Error: {str(e)}")
+        logger.error(f"OpenAI Error: {e}")
         raise HTTPException(status_code=503, detail="AI service unavailable.")
 
-@router.post("/register", response_model=UserOut)
-def register(user: UserCreate, db: Session = Depends(get_db)):
-    existing = db.query(User).filter(User.email == user.email).first()
-    if existing:
-        raise HTTPException(status_code=400, detail="Email already registered")
 
-    hashed = hash_password(user.password)
-    new_user = User(name=user.name, email=user.email, password=hashed, role="patient")
-    db.add(new_user)
-    db.commit()
-    db.refresh(new_user)
-    return new_user
+# ==== ROUTES ====
+
+@router.post("/register", response_model=UserOut)
+async def register(user: UserCreate):
+    try:
+        existing = await db.users.find_one({"email": user.email})
+        if existing:
+            raise HTTPException(status_code=400, detail="Email already registered")
+
+        hashed = hash_password(user.password)
+        new_user = {
+            "name": user.name,
+            "email": user.email,
+            "password": hashed,
+            "role": "patient"
+        }
+        result = await db.users.insert_one(new_user)
+        new_user["_id"] = str(result.inserted_id)
+        return new_user
+    except Exception as e:
+        print("❌ Error in /register:", e)
+        raise HTTPException(status_code=500, detail="Internal Server Error")
 
 @router.post("/login")
-def login(user: UserLogin, db: Session = Depends(get_db)):
-    db_user = db.query(User).filter(User.email == user.email).first()
-    if not db_user or not verify_password(user.password, db_user.password):
+async def login(user: UserLogin):
+    db_user = await db.users.find_one({"email": user.email})
+    if not db_user or not verify_password(user.password, db_user["password"]):
         raise HTTPException(status_code=400, detail="Invalid credentials")
 
-    token = create_access_token({
-        "sub": str(db_user.id),
-        "email": db_user.email,
-    })
+    token = create_access_token({"sub": str(db_user["_id"]), "email": db_user["email"]})
     return {"access_token": token, "token_type": "bearer"}
 
-@router.post("/refresh-token", response_model=TokenRefreshResponse)
-async def refresh_token(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    db_user = db.query(User).filter(User.id == current_user.id).first()
-    if not db_user:
-        raise HTTPException(status_code=404, detail="User not found")
-
-    new_token = create_access_token({
-        "sub": str(db_user.id),
-        "email": db_user.email,
-        "role": db_user.role
-    })
-    return {"access_token": new_token, "token_type": "bearer"}
-
 @router.post("/vitals", response_model=VitalsOut)
-async def submit_vitals(data: VitalsCreate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    vitals = Vitals(
-        user_id=current_user.id,
-        heart_rate=data.heart_rate,
-        bp_systolic=data.bp_systolic,
-        bp_diastolic=data.bp_diastolic,
-        oxygen=data.oxygen,
-        temperature=data.temperature,
-        sugar=data.sugar,
-        symptoms=data.symptoms,
-        timestamp=datetime.utcnow()
-    )
-    db.add(vitals)
-    db.commit()
-    db.refresh(vitals)
+async def submit_vitals(data: VitalsCreate, current_user: dict = Depends(get_current_user)):
+    vitals = data.dict()
+    vitals.update({
+        "user_id": str(current_user["_id"]),
+        "timestamp": datetime.utcnow()
+    })
+    result = await db.vitals.insert_one(vitals)
+    vitals["_id"] = str(result.inserted_id)
+
+    # 🛠️ FIX: make datetime serializable
+    vitals_copy = {**vitals, "timestamp": vitals["timestamp"].isoformat()}
+
     await manager.send_personal_message(
-        json.dumps({
-            "event": "new_vitals",
-            "data": {
-                "id": vitals.id,
-                "timestamp": vitals.timestamp.isoformat(),
-                "heart_rate": vitals.heart_rate,
-                "status": "success"
-            }
-        }),
-        str(current_user.id)
+        json.dumps({"event": "new_vitals", "data": vitals_copy}),
+        current_user["_id"]
     )
+
     return vitals
 
 @router.get("/vitals", response_model=List[VitalsOut])
-def get_vitals(days: Optional[int] = Query(None, ge=1), limit: Optional[int] = Query(None, ge=1, le=1000), db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    query = db.query(Vitals).filter(Vitals.user_id == current_user.id)
+async def get_vitals(
+    days: Optional[int] = Query(None),
+    limit: Optional[int] = Query(None),
+    current_user: dict = Depends(get_current_user)
+):
+    filter = {"user_id": str(current_user["_id"])}
+    
     if days:
         since = datetime.utcnow() - timedelta(days=days)
-        query = query.filter(Vitals.timestamp >= since)
-    query = query.order_by(Vitals.timestamp.desc())
+        filter["timestamp"] = {"$gte": since}
+
+    cursor = db.vitals.find(filter).sort("timestamp", -1)
     if limit:
-        query = query.limit(limit)
-    return query.all()
+        cursor = cursor.limit(limit)
+
+    results = await cursor.to_list(length=limit or 1000)
+    for doc in results:
+        doc["_id"] = str(doc["_id"])
+        doc["timestamp"] = doc["timestamp"].isoformat()  # 🛠️ fix datetime
+    return results
+
 
 @router.post("/analyze-symptoms")
-async def analyze_symptoms(payload: SymptomInput, current_user: User = Depends(get_current_user)):
-    advice = await get_ai_response(payload.symptoms)
-    return {"analysis": advice}
+async def analyze_symptoms(payload: SymptomInput, current_user: dict = Depends(get_current_user)):
+    analysis = await get_ai_response(payload.symptoms)
+    return {"analysis": analysis}
 
 @router.post("/appointments", response_model=AppointmentOut)
-async def book_appointment(payload: AppointmentCreate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    specialization = get_specialist_for_symptom(payload.reason)
-    doctor = db.query(Doctor).filter_by(specialization=specialization, is_available=True).first()
-    doctor_name = doctor.name if doctor else "Dr. Auto Assign"
+async def book_appointment(payload: AppointmentCreate, current_user: dict = Depends(get_current_user)):
+    try:
+        specialization = get_specialist_for_symptom(payload.reason)
+        doctor = await db.doctors.find_one({"specialization": specialization, "is_available": True})
+        doctor_name = doctor["name"] if doctor else "Dr. Auto Assign"
 
-    appointment = Appointment(
-        user_id=current_user.id,
-        reason=payload.reason,
-        notes=payload.notes,
-        doctor_name=doctor_name,
-        preferred_date=payload.preferred_date,
-        preferred_time=payload.preferred_time,
-        status="pending",
-        created_at=datetime.utcnow()
-    )
-    db.add(appointment)
-    db.commit()
-    db.refresh(appointment)
+        appointment = payload.dict()
+        appointment.update({
+            "user_id": str(current_user["_id"]),
+            "doctor_name": doctor_name,
+            "status": "pending",
+            "created_at": datetime.utcnow()
+        })
 
-    await manager.broadcast({
-        "event": "new_appointment",
-        "data": {
-            "id": appointment.id,
-            "user_id": current_user.id,
-            "status": appointment.status,
-            "timestamp": appointment.created_at.isoformat()
-        }
-    })
-    return appointment
+        result = await db.appointments.insert_one(appointment)
+        appointment["_id"] = str(result.inserted_id)
+        appointment["created_at"] = appointment["created_at"].isoformat()  # ✅ Fix datetime serialization
+
+        # Broadcast new appointment (converted to JSON-serializable form)
+        await manager.broadcast({
+            "event": "new_appointment",
+            "data": {
+                **appointment
+            }
+        })
+
+        return appointment
+    except Exception as e:
+        print("❌ Error in /appointments:", e)
+        raise HTTPException(status_code=500, detail="Failed to book appointment")
+
 
 @router.get("/appointments", response_model=List[AppointmentOut])
-def get_user_appointments(status: Optional[str] = Query(None), upcoming: Optional[bool] = Query(None), doctor: Optional[str] = Query(None), db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    query = db.query(Appointment).filter(Appointment.user_id == current_user.id)
-    if status:
-        query = query.filter(Appointment.status.ilike(status))
-    if doctor:
-        query = query.filter(Appointment.doctor_name.ilike(f"%{doctor}%"))
-    if upcoming:
-        now = datetime.utcnow()
-        query = query.filter((Appointment.preferred_date > now.date()) |
-                             ((Appointment.preferred_date == now.date()) & (Appointment.preferred_time > now.time())))
-    return query.order_by(Appointment.created_at.desc()).all()
+async def get_user_appointments(
+    status: Optional[str] = None,
+    upcoming: Optional[bool] = None,
+    doctor: Optional[str] = None,
+    current_user: dict = Depends(get_current_user)
+):
+    try:
+        filter = {"user_id": str(current_user["_id"])}  # ✅ Ensure it's a string
+        if status:
+            filter["status"] = status
+        if doctor:
+            filter["doctor_name"] = {"$regex": doctor, "$options": "i"}
+        if upcoming:
+            now = datetime.utcnow()
+            filter["preferred_date"] = {"$gte": now}
+
+        results = await db.appointments.find(filter).sort("created_at", -1).to_list(100)
+
+        # ✅ Convert ObjectId and datetime for safe JSON response
+        cleaned = []
+        for doc in results:
+            doc["_id"] = str(doc["_id"])
+            doc["user_id"] = str(doc["user_id"])
+            if "preferred_date" in doc and isinstance(doc["preferred_date"], datetime):
+                doc["preferred_date"] = doc["preferred_date"].isoformat()
+            if "created_at" in doc and isinstance(doc["created_at"], datetime):
+                doc["created_at"] = doc["created_at"].isoformat()
+            cleaned.append(doc)
+
+        return cleaned
+
+    except Exception as e:
+        print("❌ Error in /appointments GET:", e)
+        raise HTTPException(status_code=500, detail="Failed to fetch appointments")
+
+
+from fastapi import WebSocket, WebSocketDisconnect, HTTPException
 
 @router.websocket("/ws/vitals")
 async def websocket_vitals(websocket: WebSocket):
     try:
         user = await get_current_user_websocket(websocket)
-        await manager.connect(websocket, user["id"])
-        logger.info(f"WebSocket connected for user {user['email']}")
+        user_id = user["id"]
+        await manager.connect(websocket, user_id)
         while True:
             try:
                 data = await websocket.receive_text()
                 if data == "ping":
                     await websocket.send_text("pong")
             except WebSocketDisconnect:
-                manager.disconnect(user["id"])
-                logger.info(f"WebSocket disconnected for user {user['email']}")
+                manager.disconnect(user_id)
                 break
             except Exception as e:
-                manager.disconnect(user["id"])
-                logger.error(f"WebSocket error for user {user['email']}: {str(e)}")
+                print(f"Unexpected error in WebSocket loop: {e}")
+                manager.disconnect(user_id)
                 await websocket.close()
                 break
     except HTTPException as e:
-        logger.error(f"WebSocket auth failed: {e.detail}")
+        print(f"WebSocket closed due to auth issue: {e.detail}")
     except Exception as e:
-        logger.error(f"Unexpected WebSocket error: {str(e)}")
+        print(f"WebSocket closed due to server error: {e}")
         await websocket.close(code=1011)
