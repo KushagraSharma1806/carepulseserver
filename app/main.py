@@ -4,12 +4,13 @@ from app.routes import router
 from app.database import init_db
 from app.scheduler import assign_pending_appointments_mongo
 import asyncio
+import os
 
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=["http://localhost:5173"],  # You can also allow frontend domain when deployed
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -29,8 +30,14 @@ async def app_startup():
     await init_db()
     print("✅ Beanie initialized with MongoDB")
 
-    asyncio.create_task(scheduler_loop())  # ✅ No new thread, stays in FastAPI loop
+    asyncio.create_task(scheduler_loop())
     print("✅ Background MongoDB scheduler started")
 
-# Include routes
+# ✅ Include API routes
 app.include_router(router)
+
+# ✅ For Render deployment: bind to 0.0.0.0 and use PORT from environment
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))  # fallback to 8000 if PORT not set
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
